@@ -1,0 +1,17 @@
+# Local documents and extracted content
+*.mdmf
+*.pdf
+*.exe
+fixtures/
+# Build products
+build/
+*.app/
+*.zip
+CoreTests
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
+AppIcon.iconset/
+# Editor and system files
+.DS_Store
+.vscode/
