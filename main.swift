@@ -49,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var progress: NSProgressIndicator!
     private var outputFolder: URL?
     private var outputs: [URL] = []
+    private var pdfOutputs: [URL] = []
     private var pending: [URL] = []
     private var running = false
     private var failureCount = 0
@@ -84,7 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appItem = NSMenuItem()
         bar.addItem(appItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "MDMF PDF 추출기 종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "MDMF 파일 추출기 종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         let fileItem = NSMenuItem()
         bar.addItem(fileItem)
@@ -102,7 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private func makeWindow() {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 610), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-        window.title = "MDMF PDF 추출기"
+        window.title = "MDMF 파일 추출기"
         window.isReleasedWhenClosed = false
         let root = NSView()
         window.contentView = root
@@ -118,8 +119,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 26),
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -24)
         ])
-        stack.addArrangedSubview(label("MDMF → PDF", size: 29, weight: .bold))
-        let subtitle = label("공문을 Mac에서 열 수 있는 PDF로 추출합니다.", size: 14)
+        stack.addArrangedSubview(label("MDMF → 공문 + 모든 붙임파일", size: 29, weight: .bold))
+        let subtitle = label("PDF · HWP · HWPX · ZIP · 엑셀 등 포함된 파일을 그대로 꺼냅니다.", size: 14)
         subtitle.textColor = .secondaryLabelColor
         stack.addArrangedSubview(subtitle)
         let drop = DropArea(frame: .zero)
@@ -197,7 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func chooseFiles() {
         guard !running else { return }
         let panel = NSOpenPanel()
-        panel.title = "PDF를 추출할 MDMF 파일 선택"
+        panel.title = "공문과 붙임파일을 추출할 MDMF 파일 선택"
         panel.allowedContentTypes = [UTType(filenameExtension: "mdmf") ?? .data]
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
@@ -208,7 +209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func chooseFolder() {
         let panel = NSOpenPanel()
-        panel.title = "PDF를 저장할 폴더 선택"
+        panel.title = "추출한 파일을 저장할 폴더 선택"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
@@ -226,6 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         running = true
         if !continuing {
             outputs = []
+            pdfOutputs = []
             failureCount = 0
             log.string = ""
         }
@@ -234,7 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openButton.isEnabled = false
         revealButton.isEnabled = false
         progress.startAnimation(nil)
-        status.stringValue = "\(urls.count)개 파일에서 PDF를 추출하고 있습니다…"
+        status.stringValue = "\(urls.count)개 MDMF에서 공문과 붙임파일을 추출하고 있습니다…"
         let destination = outputFolder
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var results: [ExtractionResult] = []
@@ -244,6 +246,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let result = try MDMFExtractor.extract(url, outputDirectory: destination)
                     results.append(result)
                     messages.append("✓ \(result.outputURL.lastPathComponent)  ·  \(result.pageCount)페이지")
+                    for attachment in result.attachmentURLs {
+                        messages.append("✓ \(attachment.lastPathComponent)  ·  붙임파일")
+                    }
                 } catch {
                     messages.append("실패 · \(url.lastPathComponent)\n\(error.localizedDescription)")
                 }
@@ -251,14 +256,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.running = false
-                self.outputs.append(contentsOf: results.map(\.outputURL))
+                self.outputs.append(contentsOf: results.flatMap(\.outputURLs))
+                self.pdfOutputs.append(contentsOf: results.map(\.outputURL))
                 self.failureCount += urls.count - results.count
                 self.log.string += (self.log.string.isEmpty ? "" : "\n\n") + messages.joined(separator: "\n\n")
-                self.status.stringValue = "추출 완료 \(self.outputs.count)개" + (self.failureCount > 0 ? " · 실패 \(self.failureCount)개" : "")
+                self.status.stringValue = "추출 완료 · PDF \(self.pdfOutputs.count)개 · 붙임 \(self.outputs.count - self.pdfOutputs.count)개" + (self.failureCount > 0 ? " · 실패 \(self.failureCount)개" : "")
                 self.progress.stopAnimation(nil)
                 self.chooseButton.isEnabled = true
                 self.folderButton.isEnabled = true
-                self.openButton.isEnabled = !self.outputs.isEmpty
+                self.openButton.isEnabled = !self.pdfOutputs.isEmpty
                 self.revealButton.isEnabled = !self.outputs.isEmpty
                 if !self.pending.isEmpty {
                     let next = self.pending
@@ -268,17 +274,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
-    @objc private func openPDF() { for url in outputs { NSWorkspace.shared.open(url) } }
+    @objc private func openPDF() { for url in pdfOutputs { NSWorkspace.shared.open(url) } }
     @objc private func revealPDF() { NSWorkspace.shared.activateFileViewerSelecting(outputs) }
 }
 
 func runCLI(_ args: [String]) -> Int32 {
     if args.contains("--help") || args.contains("-h") {
         print("""
-        MDMF PDF 추출기 1.0
+        MDMF 파일 추출기 1.1 — PDF + 붙임파일
         사용법: mdmf-extract --extract 파일.mdmf [파일2.mdmf ...] [--output-dir 폴더]
         기본 저장 위치는 원본 폴더입니다. 기존 파일은 덮어쓰지 않습니다.
-        지원: MarkAny MDMFILEFXC v11, 헤더 2227바이트인 PDF 문서.
+        지원: MarkAny MDMFILEFXC v11, 헤더 2227바이트인 PDF 본문 및 포함된 붙임파일.
         """)
         return 0
     }
@@ -303,6 +309,9 @@ func runCLI(_ args: [String]) -> Int32 {
         do {
             let result = try MDMFExtractor.extract(file, outputDirectory: output)
             print("\(result.outputURL.path) (\(result.pageCount)페이지)")
+            for attachment in result.attachmentURLs {
+                print("\(attachment.path) (붙임파일)")
+            }
         } catch {
             fputs("오류 [\(file.lastPathComponent)]: \(error.localizedDescription)\n", stderr)
             failed = true

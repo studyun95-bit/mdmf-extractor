@@ -2,11 +2,26 @@ import Foundation
 import CommonCrypto
 import PDFKit
 import Darwin
+import CoreFoundation
+import zlib
 
 struct ExtractionResult {
     let inputURL: URL
     let outputURL: URL
     let pageCount: Int
+    let attachmentURLs: [URL]
+    var outputURLs: [URL] { [outputURL] + attachmentURLs }
+}
+
+struct DecodedAttachment {
+    let fileName: String
+    let data: Data
+}
+
+struct DecodedArchive {
+    let pdf: Data
+    let pageCount: Int
+    let attachments: [DecodedAttachment]
 }
 
 enum ExtractionError: LocalizedError {
@@ -24,19 +39,19 @@ enum ExtractionError: LocalizedError {
         case .damaged(let detail):
             return "파일이 손상되었거나 끝까지 다운로드되지 않았습니다. \(detail)"
         case .tooLarge:
-            return "100 MB를 넘는 파일은 지원하지 않습니다."
+            return "입력 파일 또는 추출 결과 전체 크기가 100 MB를 넘으면 지원하지 않습니다."
         case .invalidPDF:
             return "정상적인 PDF를 확인할 수 없습니다. 이 MDMF 형식은 지원하지 않거나 파일이 손상되었습니다."
         case .cannotRead(let detail):
             return "파일을 읽을 수 없습니다. \(detail)"
         case .cannotWrite(let detail):
-            return "PDF를 저장할 수 없습니다. \(detail)"
+            return "파일을 저장할 수 없습니다. \(detail)"
         }
     }
 }
 
 /// Offline reader for the verified MDMFILEFXC / version 11 / 2227-byte header layout.
-/// This extracts the embedded PDF bytes; it does not verify the issuer's signature.
+/// Extracts the PDF and the optional attachment container; does not verify the issuer's signature.
 enum MDMFExtractor {
     static let maximumInputSize = 100_000_000
     private static let headerLength = 2227
@@ -44,21 +59,35 @@ enum MDMFExtractor {
 
     static func extract(_ input: URL, outputDirectory: URL? = nil) throws -> ExtractionResult {
         let raw = try readBounded(input)
-        let (pdf, pageCount) = try decodeValidated(raw)
+        // Decode and validate every attachment before creating any output.
+        let archive = try decodeArchive(raw)
         let directory = outputDirectory ?? input.deletingLastPathComponent()
         guard directory.isFileURL else {
             throw ExtractionError.cannotWrite("로컬 폴더를 선택해 주세요.")
         }
         let base = input.deletingPathExtension().lastPathComponent
-        let output = try writeExclusive(pdf, directory: directory, baseName: base)
-        return ExtractionResult(inputURL: input, outputURL: output, pageCount: pageCount)
+        var created: [URL] = []
+        do {
+            let output = try writeExclusive(archive.pdf, directory: directory,
+                                            fileName: "\(base.isEmpty ? "추출한 공문" : base).pdf")
+            created.append(output)
+            for attachment in archive.attachments {
+                created.append(try writeExclusive(attachment.data, directory: directory,
+                                                   fileName: attachment.fileName))
+            }
+            return ExtractionResult(inputURL: input, outputURL: output, pageCount: archive.pageCount,
+                                    attachmentURLs: Array(created.dropFirst()))
+        } catch {
+            for url in created.reversed() { try? FileManager.default.removeItem(at: url) }
+            throw error
+        }
     }
 
     static func decode(_ data: Data) throws -> Data {
-        try decodeValidated(data).0
+        try decodeArchive(data).pdf
     }
 
-    private static func decodeValidated(_ data: Data) throws -> (Data, Int) {
+    static func decodeArchive(_ data: Data) throws -> DecodedArchive {
         guard data.count <= maximumInputSize else { throw ExtractionError.tooLarge }
         guard data.count >= 22 else { throw ExtractionError.damaged("파일 머리말이 부족합니다.") }
         guard try bytes(data, at: 0, count: 10) == Data("MDMFILEFXC".utf8) else {
@@ -109,7 +138,122 @@ enum MDMFExtractor {
         for page in 0..<document.pageCount {
             guard document.page(at: page) != nil else { throw ExtractionError.invalidPDF }
         }
-        return (pdf, document.pageCount)
+        let attachments = try decodeAttachments(data, at: pdfStart + pdfLength, header: header,
+                                                pdfLength: pdfLength)
+        return DecodedArchive(pdf: pdf, pageCount: document.pageCount, attachments: attachments)
+    }
+
+    private static func decodeAttachments(_ raw: Data, at start: Int, header: Data,
+                                          pdfLength: Int) throws -> [DecodedAttachment] {
+        if start == raw.count { return [] }
+        let marker = Data("MATTACHDAT".utf8)
+        guard try bytes(raw, at: start, count: marker.count) == marker else {
+            throw ExtractionError.unsupported("PDF 뒤의 추가 데이터 형식을 확인할 수 없습니다.")
+        }
+        let totalLength = try bigEndian(raw, at: start + 10)
+        let metadataLength = try bigEndian(raw, at: start + 14)
+        guard totalLength == raw.count - start - 18,
+              metadataLength >= 276, metadataLength <= 1_048_576,
+              metadataLength <= totalLength else {
+            throw ExtractionError.damaged("첨부 목록의 크기가 올바르지 않습니다.")
+        }
+        let metadata = try decrypt(try bytes(raw, at: start + 18, count: metadataLength),
+                                   key: try bytes(header, at: 1013, count: 16))
+        let textLength = try bigEndian(metadata, at: 0)
+        try checkRange(metadata, at: 4, count: textLength)
+        let count = try bigEndian(metadata, at: 4 + textLength)
+        guard count <= 1_000 else { throw ExtractionError.damaged("첨부 파일 수가 너무 많습니다.") }
+        let recordsStart = 4 + textLength + 4 + 268 // Count, main PDF record, attachment records.
+        guard recordsStart <= metadata.count,
+              count * 268 == metadata.count - recordsStart else {
+            throw ExtractionError.damaged("첨부 목록의 구성이 올바르지 않습니다.")
+        }
+        let payloadStart = start + 18 + metadataLength
+        let payloadLength = totalLength - metadataLength
+        let attachmentKey = try bytes(header, at: 1045, count: 16)
+        var attachments: [DecodedAttachment] = []
+        var expectedOffset = 0
+        var outputSize = pdfLength
+        for index in 0..<count {
+            let record = recordsStart + index * 268
+            let fileName = try attachmentName(try bytes(metadata, at: record, count: 256))
+            let originalSize = try bigEndian(metadata, at: record + 256)
+            let storedSize = try bigEndian(metadata, at: record + 260)
+            let offset = try bigEndian(metadata, at: record + 264)
+            guard originalSize <= maximumInputSize - outputSize else { throw ExtractionError.tooLarge }
+            outputSize += originalSize
+            guard offset == expectedOffset, storedSize >= 4,
+                  offset <= payloadLength, storedSize <= payloadLength - offset else {
+                throw ExtractionError.damaged("첨부 파일의 위치 또는 크기가 올바르지 않습니다.")
+            }
+            let encrypted = try bytes(raw, at: payloadStart + offset, count: storedSize)
+            let compressed = try decrypt(encrypted, key: attachmentKey)
+            let content = try inflateAttachment(compressed, expectedSize: originalSize)
+            attachments.append(DecodedAttachment(fileName: fileName, data: content))
+            expectedOffset += storedSize
+        }
+        guard expectedOffset == payloadLength else {
+            throw ExtractionError.damaged("첨부 데이터에 확인되지 않은 내용이 남아 있습니다.")
+        }
+        return attachments
+    }
+
+    private static func attachmentName(_ field: Data) throws -> String {
+        guard let terminator = field.firstIndex(of: 0), terminator > field.startIndex else {
+            throw ExtractionError.damaged("첨부 파일 이름이 올바르지 않습니다.")
+        }
+        let encoding = CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.dosKorean.rawValue))
+        guard let name = String(data: field.prefix(upTo: terminator), encoding: String.Encoding(rawValue: encoding)),
+              !name.isEmpty, name != ".", name != "..",
+              !name.contains("/"), !name.contains("\\"), !name.contains(":"),
+              !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              name.utf8.count <= 255 else {
+            throw ExtractionError.damaged("안전하게 저장할 수 없는 첨부 파일 이름입니다.")
+        }
+        return name
+    }
+
+    private static func inflateAttachment(_ stream: Data, expectedSize: Int) throws -> Data {
+        guard try bigEndian(stream, at: 0) == expectedSize else {
+            throw ExtractionError.damaged("첨부 파일의 원본 크기가 일치하지 않습니다.")
+        }
+        var position = 4
+        var output = Data()
+        output.reserveCapacity(expectedSize)
+        while position < stream.count {
+            let compressedSize = try bigEndian(stream, at: position)
+            position += 4
+            guard compressedSize > 0, compressedSize <= 45_000 else {
+                throw ExtractionError.damaged("첨부 압축 블록의 크기가 올바르지 않습니다.")
+            }
+            let compressed = try bytes(stream, at: position, count: compressedSize)
+            position += compressedSize
+            var block = [UInt8](repeating: 0, count: 30_001)
+            var inflatedSize = uLongf(block.count)
+            var consumedSize = uLong(compressed.count)
+            let status = compressed.withUnsafeBytes { buffer in
+                uncompress2(&block, &inflatedSize,
+                            buffer.bindMemory(to: Bytef.self).baseAddress!, &consumedSize)
+            }
+            guard status == Z_OK, consumedSize == compressed.count,
+                  inflatedSize > 0, inflatedSize <= block.count,
+                  block[Int(inflatedSize) - 1] == 0 else {
+                throw ExtractionError.damaged("첨부 파일의 압축 데이터를 복원할 수 없습니다.")
+            }
+            let amount = Int(inflatedSize) - 1 // The writer adds one sentinel NUL per zlib block.
+            guard amount > 0, amount <= expectedSize - output.count else {
+                throw ExtractionError.damaged("첨부 파일의 복원 크기가 올바르지 않습니다.")
+            }
+            output.append(contentsOf: block.prefix(amount))
+        }
+        guard output.count == expectedSize else {
+            throw ExtractionError.damaged("첨부 파일이 끝까지 복원되지 않았습니다.")
+        }
+        return output
+    }
+
+    private static func bigEndian(_ data: Data, at offset: Int) throws -> Int {
+        try bytes(data, at: offset, count: 4).reduce(0) { ($0 << 8) | Int($1) }
     }
 
     private static func checkRange(_ data: Data, at offset: Int, count: Int) throws {
@@ -195,11 +339,14 @@ enum MDMFExtractor {
         }
     }
 
-    private static func writeExclusive(_ pdf: Data, directory: URL, baseName: String) throws -> URL {
-        let safeBaseName = baseName.isEmpty ? "추출한 공문" : baseName
+    private static func writeExclusive(_ data: Data, directory: URL, fileName: String) throws -> URL {
+        let name = fileName as NSString
+        let fileExtension = name.pathExtension
+        let baseName = fileExtension.isEmpty ? fileName : name.deletingPathExtension
         for index in 0..<10_000 {
             let suffix = index == 0 ? "" : " (\(index + 1))"
-            let target = directory.appendingPathComponent("\(safeBaseName)\(suffix).pdf")
+            let extensionSuffix = fileExtension.isEmpty ? "" : ".\(fileExtension)"
+            let target = directory.appendingPathComponent("\(baseName)\(suffix)\(extensionSuffix)")
             let descriptor = target.withUnsafeFileSystemRepresentation { path in
                 path.map { Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600)) } ?? -1
             }
@@ -209,7 +356,7 @@ enum MDMFExtractor {
             }
             // O_EXCL reserves the name without overwriting existing files or following symlinks.
             var failure: Int32 = 0
-            pdf.withUnsafeBytes { buffer in
+            data.withUnsafeBytes { buffer in
                 var position = 0
                 while position < buffer.count {
                     let amount = Darwin.write(descriptor, buffer.baseAddress!.advanced(by: position), buffer.count - position)
