@@ -6,6 +6,8 @@ Windows 뷰어 없이 MDMF에 들어 있는 PDF 본문과 ZIP·엑셀·HWP·이�
 
 ## 사용 방법
 
+DMG 설치 파일이 있으면 열고 **MDMF 파일 추출기.app**을 **Applications** 폴더로 끌어 넣으세요. 설치 후 응용 프로그램 폴더에서 실행합니다. ZIP 배포본은 아래 방법으로 실행할 수 있습니다.
+
 1. 저장소의 **MDMF-PDF-Extractor.zip**을 내려받아 압축을 풀고 **MDMF 파일 추출기.app**을 더블클릭합니다.
 2. **파일 선택…**으로 `.mdmf` 파일을 선택하거나, 앱 창으로 끌어놓습니다. 여러 파일도 한 번에 처리할 수 있습니다.
 3. 완료 후 **PDF 열기**로 공문을 읽거나, **Finder에서 보기**로 PDF와 붙임파일을 확인합니다. 붙임파일은 원래 이름과 확장자로 저장됩니다.
@@ -49,6 +51,18 @@ bash build.sh
 ```
 
 결과는 `build/MDMF 파일 추출기.app`입니다. 시스템의 Foundation, CommonCrypto, PDFKit, AppKit, zlib을 사용하며 외부 패키지 의존성이 없습니다.
+
+DMG 설치 파일은 앱 빌드 후 다음 명령으로 만듭니다. 앱과 Applications 바로가기, 설치 안내만 포함됩니다.
+
+```sh
+bash make-dmg.sh
+```
+
+결과는 `build/MDMF-Extractor-1.1.dmg`입니다. 기존 앱과 출력 위치를 직접 지정할 수도 있습니다.
+
+```sh
+bash make-dmg.sh "앱 경로/MDMF 파일 추출기.app" "출력 경로/MDMF-Extractor-1.1.dmg"
+```
 
 ## 테스트
 
